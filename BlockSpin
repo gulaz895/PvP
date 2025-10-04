@@ -1,39 +1,30 @@
--- Services
+-- Blox V3 RSE + Magic Bullet + Hook + WindUI
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local LocalPlayer = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
+local LocalPlayer = Players.LocalPlayer
+local lastFire, FIRE_DELAY = 0, 0.05
 
--- Config
-local UI = {ESPEnabled=false, AimEnabled=false, fov=120, hue=0, maxRange=300}
-local drawingAvailable = (type(Drawing)=="table" and type(Drawing.new)=="function")
-local fovCircle, lineRed, trajectoryLine, nameText, boxes={}
+-- Default Config
+local UIConfig = {
+    AimEnabled = true,
+    ESPEnabled = true,
+    lineRedEnabled = true,
+    fov = 500,
+    maxRange = 500
+}
 
--- Drawing setup
-if drawingAvailable then
+-- Drawing
+local espData, lineRedData, fovCircle = {}, {}, nil
+if typeof(Drawing)=="table" and typeof(Drawing.new)=="function" then
     fovCircle = Drawing.new("Circle")
     fovCircle.Thickness, fovCircle.NumSides, fovCircle.Filled = 2, 64, false
-    fovCircle.Radius = UI.fov
-    fovCircle.Color = Color3.fromHSV(0,1,1)
+    fovCircle.Color = Color3.fromRGB(255,255,0)
+    fovCircle.Radius = UIConfig.fov
     fovCircle.Visible = false
-
-    lineRed = Drawing.new("Line")
-    lineRed.Thickness = 2
-    lineRed.Color = Color3.new(1,0,0)
-    lineRed.Visible = false
-
-    trajectoryLine = Drawing.new("Line")
-    trajectoryLine.Thickness = 1
-    trajectoryLine.Color = Color3.new(1,1,0)
-    trajectoryLine.Visible = false
-
-    nameText = Drawing.new("Text")
-    nameText.Center, nameText.Size, nameText.Outline = true, 18, true
-    nameText.Color = Color3.new(1,1,1)
-    nameText.Visible = false
 end
 
--- Detect weapon
+-- Weapon/Remote Detection
 local function detectWeapon(player)
     if player and player.Character then
         for _,v in ipairs(player.Character:GetChildren()) do
@@ -43,220 +34,150 @@ local function detectWeapon(player)
 end
 
 local function getWeaponRemote(weapon)
-    if not weapon then return nil end
-    for _,v in ipairs(weapon:GetChildren()) do
-        if v:IsA("RemoteEvent") then return v end
+    if weapon then
+        for _,v in ipairs(weapon:GetChildren()) do
+            if v:IsA("RemoteEvent") then return v end
+        end
     end
 end
 
--- Closest in FOV
+-- FOV check
+local function isHeadInFOV(headPos)
+    local pos = Camera:WorldToViewportPoint(headPos)
+    if pos.Z <= 0 then return false end
+    local center = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+    return (Vector2.new(pos.X,pos.Y)-center).Magnitude <= UIConfig.fov
+end
+
+-- Magic Bullet Variables
+local firstShotFired = false
+local cachedWeapon, cachedRemote
+local bulletData
+
+-- Hook RemoteEvent
+local function hookRemote(remote)
+    if remote then
+        local oldFire = remote.FireServer
+        remote.FireServer = newcclosure(function(self, ...)
+            local args = {...}
+            if args[2] == "shoot_gun" and firstShotFired and bulletData then
+                args[4] = bulletData
+            end
+            return oldFire(self, unpack(args))
+        end)
+    end
+end
+
+-- Fire at head
+local function fireAtHead(target)
+    if not target or not target.Character then return end
+    local head = target.Character:FindFirstChild("Head")
+    if not head or not isHeadInFOV(head.Position) then return end
+
+    local weapon = detectWeapon(LocalPlayer)
+    local remote = getWeaponRemote(weapon)
+    if not weapon or not remote then return end
+    hookRemote(remote)
+
+    if not firstShotFired then
+        bulletData = {{ {Instance=head, Normal=Vector3.new(0,1,0), Position=head.Position} }}
+        pcall(function() remote:FireServer(weapon,"shoot_gun",weapon.Handle.CFrame, bulletData) end)
+        firstShotFired = true
+        cachedWeapon = weapon
+        cachedRemote = remote
+        lastFire = tick()
+        return
+    end
+
+    if tick()-lastFire < FIRE_DELAY then return end
+    if cachedWeapon and cachedRemote then
+        pcall(function() cachedRemote:FireServer(cachedWeapon,"shoot_gun",cachedWeapon.Handle.CFrame, bulletData) end)
+        lastFire = tick()
+    end
+end
+
+-- Get closest target in FOV
 local function getClosestInFOV(radius)
     local center = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
-    local best,bestDist = nil,radius
+    local best, bestDist = nil, radius
     for _,plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer and plr.Character and plr.Character:FindFirstChild("Head") then
-            local pos = Camera:WorldToViewportPoint(plr.Character.Head.Position)
-            local screenPos = Vector2.new(pos.X,pos.Y)
-            if pos.Z>0 then
-                local d = (screenPos - center).Magnitude
-                if d < bestDist then bestDist=d; best=plr end
+            local pos,onScreen = Camera:WorldToViewportPoint(plr.Character.Head.Position)
+            if onScreen and pos.Z > 0 then
+                local d = (Vector2.new(pos.X,pos.Y)-center).Magnitude
+                if d < bestDist then best,bestDist = plr,d end
             end
         end
     end
     return best
 end
 
--- Load WindUI
-local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
-local Window = WindUI:CreateWindow({Title="My Super Hub", Icon="crosshair", Author="by .ftgs", Folder="MySuperHub", Theme="Dark"})
+-- Main loop
+RunService.RenderStepped:Connect(function()
+    local center = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+    if fovCircle then fovCircle.Position=center; fovCircle.Visible=UIConfig.AimEnabled; fovCircle.Radius=UIConfig.fov end
 
--- ESP Tab
-local ESP_Tab = Window:Tab({Title="ESP", Icon="eye"})
-ESP_Tab:Button({
-    Title="Toggle ESP",
-    Callback=function()
-        UI.ESPEnabled = not UI.ESPEnabled
-        if nameText then nameText.Visible = UI.ESPEnabled end
-        for _,plrBox in pairs(boxes) do
-            for _,line in ipairs(plrBox) do
-                line.Visible = UI.ESPEnabled
-            end
-        end
-    end
-})
-
--- Aim Tab
-local Aim_Tab = Window:Tab({Title="Aim", Icon="target"})
-Aim_Tab:Button({
-    Title="Toggle Aim",
-    Callback=function()
-        UI.AimEnabled = not UI.AimEnabled
-        if fovCircle then fovCircle.Visible = UI.AimEnabled end
-        if lineRed then lineRed.Visible = UI.AimEnabled end
-        if trajectoryLine then trajectoryLine.Visible = UI.AimEnabled end
-    end
-})
-Aim_Tab:Slider({
-    Title="FOV Radius",
-    Step=1,
-    Value={Min=50, Max=400, Default=UI.fov},
-    Callback=function(v)
-        UI.fov = v
-        if fovCircle then fovCircle.Radius=v end
-    end
-})
-Aim_Tab:Slider({
-    Title="Max Shoot Range",
-    Step=1,
-    Value={Min=50, Max=500, Default=UI.maxRange},
-    Callback=function(v) UI.maxRange=v end
-})
-
--- Render Loop
-RunService:BindToRenderStep("Project1Update", Enum.RenderPriority.Camera.Value+1, function()
-    UI.hue = (UI.hue+1)%360
-    local centerScreen = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
-
-    -- FOV Circle
-    if UI.AimEnabled and fovCircle then
-        fovCircle.Radius = UI.fov
-        fovCircle.Color = Color3.fromHSV(UI.hue/360,1,1)
-        fovCircle.Position = centerScreen
+    local target = UIConfig.AimEnabled and getClosestInFOV(UIConfig.fov)
+    if target and (target.Character.HumanoidRootPart.Position - LocalPlayer.Character.HumanoidRootPart.Position).Magnitude <= UIConfig.maxRange then
+        fireAtHead(target)
     end
 
-    -- Target
-    local target = getClosestInFOV(UI.fov)
-    local lockedTarget = target
+    -- ESP + Red Line
+    for _,plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character and plr.Character:FindFirstChild("Head") and plr.Character:FindFirstChild("HumanoidRootPart") then
+            local root, head = plr.Character.HumanoidRootPart, plr.Character.Head
+            local posRoot,onRoot = Camera:WorldToViewportPoint(root.Position)
+            local posHead,onHead = Camera:WorldToViewportPoint(head.Position)
 
-    -- Aim + AutoShoot + Wallbang
-    if UI.AimEnabled and target and target.Character and target.Character:FindFirstChild("Head") then
-        local headPos3D = target.Character.Head.Position
-        local headPos = Camera:WorldToViewportPoint(headPos3D)
-        if headPos.Z>0 then
-            local screenPos = Vector2.new(headPos.X, headPos.Y)
-            local dist = (LocalPlayer.Character.Head.Position - headPos3D).Magnitude
+            if onRoot and onHead then
+                if not espData[plr] then
+                    espData[plr] = {box={}, text=Drawing.new("Text")}
+                    for i=1,4 do espData[plr].box[i] = Drawing.new("Line"); espData[plr].box[i].Thickness=2 end
+                    espData[plr].text.Size=14; espData[plr].text.Center=true; espData[plr].text.Outline=true
+                end
+                local height = math.abs(posHead.Y-posRoot.Y)
+                local width = math.clamp(height*0.6,20,400)
+                local top,bottom = Vector2.new(posHead.X,posHead.Y), Vector2.new(posRoot.X,posRoot.Y)
+                local box = espData[plr].box
+                box[1].From,box[1].To = Vector2.new(top.X-width/2,top.Y), Vector2.new(top.X+width/2,top.Y)
+                box[2].From,box[2].To = Vector2.new(top.X+width/2,top.Y), Vector2.new(bottom.X+width/2,bottom.Y)
+                box[3].From,box[3].To = Vector2.new(bottom.X+width/2,bottom.Y), Vector2.new(bottom.X-width/2,bottom.Y)
+                box[4].From,box[4].To = Vector2.new(bottom.X-width/2,bottom.Y), Vector2.new(top.X-width/2,top.Y)
+                for i=1,4 do box[i].Visible=UIConfig.ESPEnabled; box[i].Color=Color3.new(1,0,0) end
 
-            -- Line
-            if lineRed then
-                lineRed.From = centerScreen
-                lineRed.To = screenPos
-                lineRed.Color = Color3.fromHSV(UI.hue/360,1,1)
-                lineRed.Visible = true
-            end
+                local dist = (LocalPlayer.Character.HumanoidRootPart.Position - root.Position).Magnitude
+                espData[plr].text.Text = string.format("%s | %dm", plr.Name, math.floor(dist))
+                espData[plr].text.Position = Vector2.new(posHead.X,posHead.Y-15)
+                espData[plr].text.Visible=UIConfig.ESPEnabled
 
-            -- Trajectory
-            if trajectoryLine then
-                local dir = (headPos3D - LocalPlayer.Character.Head.Position).Unit
-                local maxPoint = LocalPlayer.Character.Head.Position + dir * math.min(dist, UI.maxRange)
-                local maxScreen = Camera:WorldToViewportPoint(maxPoint)
-                trajectoryLine.From = centerScreen
-                trajectoryLine.To = Vector2.new(maxScreen.X, maxScreen.Y)
-                trajectoryLine.Visible = true
-            end
-
-            -- Name + Weapon + Distance
-            if UI.ESPEnabled and nameText then
-                local weapon = detectWeapon(target)
-                nameText.Text = target.Name..(weapon and (" | "..weapon.Name) or "")..string.format(" | %.1f studs", dist)
-                nameText.Position = screenPos-Vector2.new(0,20)
-                nameText.Color = Color3.fromHSV(UI.hue/360,1,1)
-                nameText.Visible = true
-            end
-
-            -- AutoShoot + Wallbang
-            local weapon = detectWeapon(LocalPlayer)
-            local remote = getWeaponRemote(weapon)
-            if remote then
-                local origin = LocalPlayer.Character.Head.Position
-                local dir = (headPos3D - origin).Unit
-                local params = RaycastParams.new()
-                params.FilterDescendantsInstances = {LocalPlayer.Character}
-                params.FilterType = Enum.RaycastFilterType.Blacklist
-
-                local ray = workspace:Raycast(origin, dir * UI.maxRange, params)
-                if ray then
-                    local distToHit = (ray.Position - origin).Magnitude
-                    local distToTarget = (headPos3D - origin).Magnitude
-                    if distToTarget <= UI.fov then
-                        remote:FireServer(headPos3D)
-                    else
-                        remote:FireServer(ray.Position)
+                if UIConfig.lineRedEnabled then
+                    if not lineRedData[plr] then
+                        lineRedData[plr] = Drawing.new("Line")
+                        lineRedData[plr].Thickness = 2
+                        lineRedData[plr].Color = Color3.new(1,0,0)
                     end
-                else
-                    remote:FireServer(headPos3D)
+                    lineRedData[plr].From = Vector2.new(center.X, center.Y)
+                    lineRedData[plr].To = Vector2.new(posHead.X,posHead.Y)
+                    lineRedData[plr].Visible = UIConfig.ESPEnabled
                 end
+            elseif espData[plr] then
+                for i=1,4 do espData[plr].box[i].Visible=false end
+                espData[plr].text.Visible=false
+                if lineRedData[plr] then lineRedData[plr].Visible=false end
             end
-        end
-    else
-        if lineRed then lineRed.Visible=false end
-        if trajectoryLine then trajectoryLine.Visible=false end
-        if nameText and UI.ESPEnabled then nameText.Visible=false end
-    end
-
-    -- ESP Bounding Box
-    if UI.ESPEnabled then
-        for _,plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") and plr.Character:FindFirstChild("Head") then
-                local hrp = plr.Character.HumanoidRootPart
-                local head = plr.Character.Head
-                local top,bottom = head.Position, hrp.Position - Vector3.new(0, hrp.Size.Y/2, 0)
-
-                local corners3D = {
-                    Vector3.new(bottom.X-1,bottom.Y,bottom.Z-1), Vector3.new(bottom.X+1,bottom.Y,bottom.Z-1),
-                    Vector3.new(bottom.X+1,bottom.Y,bottom.Z+1), Vector3.new(bottom.X-1,bottom.Y,bottom.Z+1),
-                    Vector3.new(top.X-1,top.Y,top.Z-1), Vector3.new(top.X+1,top.Y,top.Z-1),
-                    Vector3.new(top.X+1,top.Y,top.Z+1), Vector3.new(top.X-1,top.Y,top.Z+1)
-                }
-                local screenCorners = {}
-                for i,v in ipairs(corners3D) do
-                    local p = Camera:WorldToViewportPoint(v)
-                    screenCorners[i] = Vector2.new(p.X,p.Y)
-                end
-
-                if not boxes[plr] then
-                    boxes[plr]={}
-                    for i=1,12 do
-                        local line = Drawing.new("Line")
-                        line.Thickness = 2
-                        line.Visible = true
-                        table.insert(boxes[plr], line)
-                    end
-                end
-
-                local lines = boxes[plr]
-                local boxColor = (lockedTarget==plr) and Color3.new(1,0,0) or Color3.fromHSV(UI.hue/360,1,1)
-
-                -- Bottom rectangle
-                lines[1].From=screenCorners[1]; lines[1].To=screenCorners[2]
-                lines[2].From=screenCorners[2]; lines[2].To=screenCorners[3]
-                lines[3].From=screenCorners[3]; lines[3].To=screenCorners[4]
-                lines[4].From=screenCorners[4]; lines[4].To=screenCorners[1]
-
-                -- Top rectangle
-                lines[5].From=screenCorners[5]; lines[5].To=screenCorners[6]
-                lines[6].From=screenCorners[6]; lines[6].To=screenCorners[7]
-                lines[7].From=screenCorners[7]; lines[7].To=screenCorners[8]
-                lines[8].From=screenCorners[8]; lines[8].To=screenCorners[5]
-
-                -- Connect top-bottom
-                lines[9].From=screenCorners[1]; lines[9].To=screenCorners[5]
-                lines[10].From=screenCorners[2]; lines[10].To=screenCorners[6]
-                lines[11].From=screenCorners[3]; lines[11].To=screenCorners[7]
-                lines[12].From=screenCorners[4]; lines[12].To=screenCorners[8]
-
-                for _,line in ipairs(lines) do
-                    line.Color = boxColor
-                    line.Visible = true
-                end
-            elseif boxes[plr] then
-                for _,line in ipairs(boxes[plr]) do
-                    line.Visible=false
-                end
-            end
-        end
-    else
-        for _,plrBox in pairs(boxes) do
-            for _,line in ipairs(plrBox) do line.Visible=false end
         end
     end
 end)
+
+-- WindUI Setup
+local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/username/WindUI/main/init.lua"))()
+local Window = WindUI:CreateWindow("Blox V3 RSE")
+
+local AimTab = Window:CreateTab("Aim")
+AimTab:CreateToggle("Aim Enabled", UIConfig.AimEnabled, function(val) UIConfig.AimEnabled = val end)
+AimTab:CreateSlider("FOV", 100, 1000, UIConfig.fov, function(val) UIConfig.fov = val; if fovCircle then fovCircle.Radius=val end end)
+AimTab:CreateSlider("Max Range", 50, 1000, UIConfig.maxRange, function(val) UIConfig.maxRange = val end)
+
+local ESPTab = Window:CreateTab("ESP")
+ESPTab:CreateToggle("ESP Enabled", UIConfig.ESPEnabled, function(val) UIConfig.ESPEnabled = val end)
+ESPTab:CreateToggle("Red Line", UIConfig.lineRedEnabled, function(val) UIConfig.lineRedEnabled = val end)
